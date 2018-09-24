@@ -15,6 +15,7 @@ import qualified Network.HTTP.Types.Status as Status
 import qualified Network.HTTP.Types.Header as Header
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as TLS
+import qualified Data.Aeson as Aeson
 
 -- Validation
 import qualified Data.ByteString.Char8 as BSC
@@ -51,6 +52,8 @@ instance Show Error where
   -- show (ResponseMismatch diff)
   --   = "Hosts have yielded different responses: "
   --   ++ show diff
+instance Aeson.ToJSON Error where
+  toJSON = Aeson.toJSON . show
 
 -- | Entry point
 main :: IO ()
@@ -78,8 +81,9 @@ mkApp manager req respond
       (Validation.bindValidation getHeaders mkRequests)
   where
     headers = Wai.requestHeaders req
+    headersJson = [("Content-Type", "application/json")]
     mkErrorResponse :: [Error] -> Wai.Response
-    mkErrorResponse = Wai.responseLBS Status.badRequest400 [] . LBSC.pack . show
+    mkErrorResponse = Wai.responseLBS Status.badRequest400 headersJson . Aeson.encode
     getHeaders
       = (,)
       <$> getHeader headers "DIFF_HOST_A"
