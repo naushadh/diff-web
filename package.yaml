@@ -21,6 +21,16 @@ description:         Please see the README on GitHub at <https://github.com/naus
 
 dependencies:
 - base >= 4.7 && < 5
+- envy
+- warp
+- wai
+- http-types
+- http-client
+- http-client-tls
+- bytestring
+- case-insensitive
+- validation
+- async
 
 library:
   source-dirs: src

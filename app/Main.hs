@@ -3,4 +3,4 @@ module Main where
 import qualified Lib
 
 main :: IO ()
-main = Lib.someFunc
+main = Lib.main
