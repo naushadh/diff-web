@@ -36,7 +36,7 @@ data Error
   = MisConfiguredEnv String
   | HeaderNotFound Header.HeaderName
   | InvalidHost Header.HeaderName Exception.SomeException
-  -- | ResponseMismatch Diff
+  -- ResponseMismatch Diff
 instance Show Error where
   show (MisConfiguredEnv msg)
     = "Unable to parse ENV configs: " ++ msg
