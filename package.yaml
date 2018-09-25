@@ -31,6 +31,10 @@ dependencies:
 - case-insensitive
 - validation
 - async
+- process
+- diff-parse
+- temporary
+- text
 - aeson
 
 library:

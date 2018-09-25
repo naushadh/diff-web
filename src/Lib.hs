@@ -16,6 +16,16 @@ import qualified Network.HTTP.Types.Header as Header
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as TLS
 import qualified Data.Aeson as Aeson
+import           Data.Aeson ((.=))
+import qualified Control.Concurrent.Async as Async
+
+-- Diff
+import qualified System.Process as Process
+import qualified Text.Diff.Parse as Diff
+import qualified Text.Diff.Parse.Types as Diff
+import qualified System.IO.Temp as Temp
+import qualified System.Exit as Exit
+import qualified Data.Text as T
 
 -- Validation
 import qualified Data.ByteString.Char8 as BSC
@@ -37,7 +47,9 @@ data Error
   = MisConfiguredEnv String
   | HeaderNotFound Header.HeaderName
   | InvalidHost Header.HeaderName Exception.SomeException
-  -- ResponseMismatch Diff
+  | UnexpectedDiffFailure Int
+  | UnexpectedDiffParseError String
+  | ResponseMismatch [Diff]
 instance Show Error where
   show (MisConfiguredEnv msg)
     = "Unable to parse ENV configs: " ++ msg
@@ -49,11 +61,22 @@ instance Show Error where
     ++ showHeader headerName
     ++ "): "
     ++ show err
-  -- show (ResponseMismatch diff)
-  --   = "Hosts have yielded different responses: "
-  --   ++ show diff
+  show (UnexpectedDiffFailure err)
+    = "Diff command failed with code: "
+    ++ show err
+  show (UnexpectedDiffParseError err)
+    = "Unable to parse diff: "
+    ++ err
+  show (ResponseMismatch diff)
+    = "Hosts have yielded different responses: "
+    ++ show diff
 instance Aeson.ToJSON Error where
-  toJSON = Aeson.toJSON . show
+  toJSON (ResponseMismatch diff)
+    = Aeson.object
+    [ "message" .= ("Hosts have yielded different responses" :: String)
+    , "diff" .= diff
+    ]
+  toJSON x = Aeson.toJSON . show $ x
 
 -- | Entry point
 main :: IO ()
@@ -93,10 +116,95 @@ mkApp manager req respond
       <$> mkHTTPRequest h1
       <*> mkHTTPRequest h2
     go :: HTTP.Request -> HTTP.Request -> IO Wai.Response
-    go reqA _reqB = do
-      let reqA' = copyWaiToHTTP req reqA
-      response <- HTTP.httpLbs reqA' manager
-      return . httpToWaiResponse $ response
+    go reqA reqB = do
+      let runReq r = HTTP.httpLbs (copyWaiToHTTP req r) manager
+      (resA, resB) <- Async.concurrently (runReq reqA) (runReq reqB)
+      Validation.validation mkErrorResponse id <$> compareResponses resA resB
+
+--------------------------------------------------------------------------------
+-- * Diff
+
+compareResponses
+  :: HTTP.Response LBSC.ByteString -> HTTP.Response LBSC.ByteString
+  -> IO (Validation.Validation [Error] Wai.Response)
+compareResponses resA resB = do
+  let resBodyA = HTTP.responseBody resA
+  let resBodyB = HTTP.responseBody resB
+  let ok = pure . httpToWaiResponse $ resB
+  if resBodyA == resBodyB
+    then pure ok
+    else do
+      eDiff <- calculateDiff resBodyA resBodyB
+      pure $ case eDiff of
+        (Validation.Success []) -> ok
+        (Validation.Success ds) -> Validation.Failure . pure . ResponseMismatch $ ds
+        (Validation.Failure f) -> Validation.Failure f
+
+calculateDiff
+  :: LBSC.ByteString -> LBSC.ByteString
+  -> IO (Validation.Validation [Error] [Diff])
+calculateDiff a b = do
+  tmpDir <- Temp.getCanonicalTemporaryDirectory
+  Temp.withTempFile tmpDir "left" $ \fpA hA ->
+    Temp.withTempFile tmpDir "right" $ \fpB hB -> do
+      LBSC.hPut hA a
+      LBSC.hPut hB b
+      (x, diff, e) <- Process.readProcessWithExitCode "diff" ["-u", fpA, fpB] ""
+      case x of
+        Exit.ExitSuccess -> pure . pure $ []
+        (Exit.ExitFailure 1) -> pure . pure $ parseDiff diff
+        (Exit.ExitFailure n) -> do
+          logInfo . show $ e
+          pure . Validation.Failure . pure . UnexpectedDiffFailure $ n
+
+parseDiff :: String -> [Diff]
+parseDiff str = Validation.validation (const . pure . DiffRaw $ str) id $ parseDiff' str
+
+parseDiff' :: String -> Validation.Validation [Error] [Diff]
+parseDiff' str
+  = fmap (fmap DiffParsed)
+  $ Validation.liftError (pure . UnexpectedDiffParseError)
+  $ Diff.parseDiff (T.pack str)
+
+data Diff
+  = DiffParsed Diff.FileDelta
+  | DiffRaw String
+  deriving Show
+instance Aeson.ToJSON Diff where
+  toJSON (DiffParsed fd)
+    = Aeson.object
+    [ "status" .= show (Diff.fileDeltaStatus fd)
+    , "sourceFile" .= Diff.fileDeltaSourceFile fd
+    , "destFile" .= Diff.fileDeltaDestFile fd
+    , "content" .= contentToJSON (Diff.fileDeltaContent fd)
+    ]
+  toJSON (DiffRaw s) = Aeson.toJSON s
+
+contentToJSON :: Diff.Content -> Aeson.Value
+contentToJSON c@Diff.Binary = Aeson.toJSON $ show c
+contentToJSON (Diff.Hunks hs) = Aeson.toJSONList $ hunkToJSON <$> hs
+
+hunkToJSON :: Diff.Hunk -> Aeson.Value
+hunkToJSON h
+  = Aeson.object
+  [ "sourceRange" .= rangeToJSON (Diff.hunkSourceRange h)
+  , "destRange" .= rangeToJSON (Diff.hunkDestRange h)
+  , "hunkLines" .= (lineToJSON <$> Diff.hunkLines h)
+  ]
+
+rangeToJSON :: Diff.Range -> Aeson.Value
+rangeToJSON r
+  = Aeson.object
+  [ "startingLineNumber" .= Diff.rangeStartingLineNumber r
+  , "numberOfLines" .= Diff.rangeNumberOfLines r
+  ]
+
+lineToJSON :: Diff.Line -> Aeson.Value
+lineToJSON l
+  = Aeson.object
+  [ "annotation" .= show (Diff.lineAnnotation l)
+  , "content" .= Diff.lineContent l
+  ]
 
 --------------------------------------------------------------------------------
 -- * Ferrying Request/Response types between WAI and HTTP-Client
